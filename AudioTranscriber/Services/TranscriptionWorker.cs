@@ -1,5 +1,6 @@
 using AudioTranscriber.Data;
 using AudioTranscriber.Storage;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 
 namespace AudioTranscriber.Services;
@@ -43,6 +44,8 @@ public class TranscriptionWorker : BackgroundService
         var workerCount = _options.MaxConcurrentJobs > 0 ? _options.MaxConcurrentJobs : Environment.ProcessorCount;
         _logger.LogInformation("Starting {WorkerCount} transcription workers", workerCount);
 
+        await RecoverJobsAsync(stoppingToken);
+
         var workers = new List<Task>();
         for (var i = 0; i < workerCount; i++)
         {
@@ -50,6 +53,52 @@ public class TranscriptionWorker : BackgroundService
         }
 
         await Task.WhenAll(workers);
+    }
+
+    // The queue lives in memory, so after a restart it is empty. Unfinished jobs are loaded from the database again.
+    private async Task RecoverJobsAsync(CancellationToken stoppingToken)
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        // A job still marked Processing was interrupted (crash or shutdown) before it finished.
+        // This assumes a single instance; with several instances a job would need an owner or a heartbeat.
+        var interruptedJobs = await db.Jobs
+            .Where(j => j.Status == JobStatus.Processing)
+            .ToListAsync(stoppingToken);
+
+        foreach (var job in interruptedJobs)
+        {
+            if (job.Attempts >= _options.MaxAttempts)
+            {
+                // Stop a file that keeps crashing the worker from being retried forever
+                job.Status = JobStatus.Failed;
+                job.ErrorMessage = $"Processing was interrupted {job.Attempts} times, giving up.";
+                job.CompletedAt = DateTime.UtcNow;
+            }
+            else
+            {
+                job.Status = JobStatus.Queued;
+            }
+        }
+
+        await db.SaveChangesAsync(stoppingToken);
+
+        var queuedJobIds = await db.Jobs
+            .Where(j => j.Status == JobStatus.Queued)
+            .OrderBy(j => j.CreatedAt)
+            .Select(j => j.Id)
+            .ToListAsync(stoppingToken);
+
+        foreach (var jobId in queuedJobIds)
+        {
+            await _queue.EnqueueAsync(jobId, stoppingToken);
+        }
+
+        if (queuedJobIds.Count > 0)
+        {
+            _logger.LogInformation("Re-queued {Count} unfinished jobs", queuedJobIds.Count);
+        }
     }
 
     private async Task RunWorkerLoopAsync(CancellationToken stoppingToken)
@@ -132,12 +181,37 @@ public class TranscriptionWorker : BackgroundService
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            _logger.LogError(ex, "Job {JobId} failed", job.Id);
+            // Segments added before the failure must not be saved together with the error
+            foreach (var entry in db.ChangeTracker.Entries<TranscriptSegment>().ToList())
+            {
+                entry.State = EntityState.Detached;
+            }
 
-            job.Status = JobStatus.Failed;
             job.ErrorMessage = ex.Message;
-            job.CompletedAt = DateTime.UtcNow;
-            await db.SaveChangesAsync(CancellationToken.None);
+
+            // A corrupt or unsupported file will fail the same way every time, so do not retry it
+            var isPermanent = ex is AudioConversionException;
+
+            if (isPermanent || job.Attempts >= _options.MaxAttempts)
+            {
+                _logger.LogError(ex, "Job {JobId} failed after {Attempts} attempt(s)", job.Id, job.Attempts);
+
+                job.Status = JobStatus.Failed;
+                job.CompletedAt = DateTime.UtcNow;
+                await db.SaveChangesAsync(CancellationToken.None);
+            }
+            else
+            {
+                // Temporary problem (timeout, out of memory...): try again later, waiting longer each time
+                var delay = TimeSpan.FromSeconds(_options.RetryDelaySeconds * Math.Pow(2, job.Attempts - 1));
+                _logger.LogWarning(ex, "Job {JobId} attempt {Attempt} failed, retrying in {Delay}",
+                    job.Id, job.Attempts, delay);
+
+                job.Status = JobStatus.Queued;
+                await db.SaveChangesAsync(CancellationToken.None);
+
+                _ = RequeueAfterDelayAsync(job.Id, delay, stoppingToken);
+            }
         }
         finally
         {
@@ -146,6 +220,19 @@ public class TranscriptionWorker : BackgroundService
             {
                 Directory.Delete(workFolder, recursive: true);
             }
+        }
+    }
+
+    private async Task RequeueAfterDelayAsync(Guid jobId, TimeSpan delay, CancellationToken stoppingToken)
+    {
+        try
+        {
+            await Task.Delay(delay, stoppingToken);
+            await _queue.EnqueueAsync(jobId, stoppingToken);
+        }
+        catch (OperationCanceledException)
+        {
+            // App is shutting down; the job is still Queued in the database and is picked up on the next start
         }
     }
 

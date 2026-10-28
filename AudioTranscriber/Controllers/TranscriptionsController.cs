@@ -1,3 +1,4 @@
+using System.Text;
 using AudioTranscriber.Data;
 using AudioTranscriber.Models;
 using AudioTranscriber.Services;
@@ -120,6 +121,40 @@ public class TranscriptionsController : ControllerBase
             new UploadResponse { JobId = job.Id, Status = job.Status.ToString() });
     }
 
+    // Failed jobs are kept with their error so they can be inspected and then retried by hand
+    [HttpPost("{id:guid}/retry")]
+    [ProducesResponseType(typeof(UploadResponse), StatusCodes.Status202Accepted)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    [ProducesResponseType(StatusCodes.Status409Conflict)]
+    public async Task<IActionResult> Retry(Guid id, CancellationToken cancellationToken)
+    {
+        var job = await _db.Jobs.FindAsync(new object[] { id }, cancellationToken);
+        if (job == null)
+        {
+            return Problem(statusCode: StatusCodes.Status404NotFound, detail: $"Job {id} was not found.");
+        }
+
+        if (job.Status != JobStatus.Failed)
+        {
+            return Problem(statusCode: StatusCodes.Status409Conflict,
+                detail: $"Only failed jobs can be retried, this job is {job.Status}.");
+        }
+
+        job.Status = JobStatus.Queued;
+        job.Attempts = 0;
+        job.ErrorMessage = null;
+        job.StartedAt = null;
+        job.CompletedAt = null;
+        await _db.SaveChangesAsync(cancellationToken);
+
+        await _queue.EnqueueAsync(job.Id, cancellationToken);
+
+        return AcceptedAtAction(
+            nameof(GetById),
+            new { id = job.Id },
+            new UploadResponse { JobId = job.Id, Status = job.Status.ToString() });
+    }
+
     [HttpGet("{id:guid}")]
     [ProducesResponseType(typeof(TranscriptionResponse), StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
@@ -152,5 +187,69 @@ public class TranscriptionsController : ControllerBase
         };
 
         return Ok(response);
+    }
+
+    [HttpGet("{id:guid}/export")]
+    [Produces("text/plain", "application/x-subrip", "text/vtt")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    [ProducesResponseType(StatusCodes.Status409Conflict)]
+    public async Task<IActionResult> Export(Guid id, [FromQuery] string format = "srt",
+        CancellationToken cancellationToken = default)
+    {
+        format = format.ToLowerInvariant();
+        if (!TranscriptExporter.SupportedFormats.Contains(format))
+        {
+            return Problem(statusCode: StatusCodes.Status400BadRequest,
+                detail: $"Unsupported format '{format}'. Use one of: {string.Join(", ", TranscriptExporter.SupportedFormats)}.");
+        }
+
+        var job = await _db.Jobs
+            .AsNoTracking()
+            .Include(j => j.Segments.OrderBy(s => s.Index))
+            .FirstOrDefaultAsync(j => j.Id == id, cancellationToken);
+
+        if (job == null)
+        {
+            return Problem(statusCode: StatusCodes.Status404NotFound, detail: $"Job {id} was not found.");
+        }
+
+        if (job.Status != JobStatus.Completed)
+        {
+            return Problem(statusCode: StatusCodes.Status409Conflict,
+                detail: $"The transcript is not ready yet, the job is {job.Status}.");
+        }
+
+        string content;
+        string contentType;
+        switch (format)
+        {
+            case "srt":
+                content = TranscriptExporter.ToSrt(job.Segments);
+                contentType = "application/x-subrip";
+                break;
+            case "vtt":
+                content = TranscriptExporter.ToVtt(job.Segments);
+                contentType = "text/vtt";
+                break;
+            default:
+                content = TranscriptExporter.ToTxt(job.Segments);
+                contentType = "text/plain";
+                break;
+        }
+
+        // Name the download after the original file, e.g. meeting.mp3 -> meeting.srt
+        var downloadName = $"{Path.GetFileNameWithoutExtension(job.OriginalFileName)}.{format}";
+
+        return File(Encoding.UTF8.GetBytes(content), $"{contentType}; charset=utf-8", downloadName);
+    }
+
+    [HttpDelete("{id:guid}")]
+    [ProducesResponseType(StatusCodes.Status501NotImplemented)]
+    public IActionResult Delete(Guid id)
+    {
+        // TODO: delete the job, its segments and the stored audio file
+        return Problem(statusCode: StatusCodes.Status501NotImplemented, detail: "Deleting jobs is not implemented yet.");
     }
 }
