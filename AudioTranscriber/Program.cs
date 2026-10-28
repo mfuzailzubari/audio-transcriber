@@ -1,5 +1,7 @@
 using AudioTranscriber.Data;
+using AudioTranscriber.Services;
 using AudioTranscriber.Storage;
+using Microsoft.AspNetCore.Http.Features;
 using Microsoft.EntityFrameworkCore;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -13,6 +15,16 @@ builder.Services.AddDbContext<AppDbContext>(options =>
 
 builder.Services.Configure<StorageOptions>(builder.Configuration.GetSection(StorageOptions.SectionName));
 builder.Services.AddSingleton<IFileStorage, LocalFileStorage>();
+
+builder.Services.Configure<UploadOptions>(builder.Configuration.GetSection(UploadOptions.SectionName));
+builder.Services.AddSingleton<AudioFileValidator>();
+
+// Raise the default request size limits (30 MB) so large audio files can be uploaded.
+// A small margin is added for the multipart overhead; the exact limit is checked in the controller.
+var uploadOptions = builder.Configuration.GetSection(UploadOptions.SectionName).Get<UploadOptions>() ?? new UploadOptions();
+var maxRequestBytes = uploadOptions.MaxFileSizeBytes + 10 * 1024 * 1024;
+builder.WebHost.ConfigureKestrel(options => options.Limits.MaxRequestBodySize = maxRequestBytes);
+builder.Services.Configure<FormOptions>(options => options.MultipartBodyLengthLimit = maxRequestBytes);
 
 var app = builder.Build();
 
