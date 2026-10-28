@@ -1,91 +1,58 @@
-# Audio Transcription Pipeline
+# Audio Transcriber
 
-A simple REST API built with **ASP.NET Core Web API** that accepts an audio file, converts spoken language into text using **Whisper.net**, and returns the transcript with timestamps per segment.
+A REST API in ASP.NET Core (.NET 8) that takes an audio file and returns the transcript with timestamps. Transcription is done locally with Whisper.net, so there is no external API or cost.
 
-The focus of this project is on engineering decisions, not on training a model.
-
----
-
-## 1. Overview
+## How it works
 
 ```
-Client ──► POST /api/transcriptions ──► Save file ──► Queue job ──► Return job ID
-                                                          │
-                                                          ▼
-                                                  Background worker
-                                                          │
-                                        FFmpeg (normalize to 16 kHz mono WAV)
-                                                          │
-                                        Split into chunks (long files only)
-                                                          │
-                                           Whisper.net transcription
-                                                          │
-                                     Save transcript + segments to database
-                                                          │
-Client ◄── GET /api/transcriptions/{id} ◄──── Status: Completed
+POST /api/transcriptions -> validate and save file -> create job (Queued) -> return job id
+                                                              |
+                                                     background worker
+                                                              |
+                                          FFmpeg: convert to 16 kHz mono WAV
+                                                              |
+                                          split into chunks if the file is long
+                                                              |
+                                                     Whisper.net
+                                                              |
+                                          save text and segments to the database
+                                                              |
+GET /api/transcriptions/{id} <---------------------- status: Completed
 ```
 
----
+The upload only saves the file and creates a job, so it returns quickly. The heavy work happens in a background worker, and the client polls for the result.
 
-## 2. Tech Stack
+## Tech used
 
-| Part | Choice | Why |
-|------|--------|-----|
-| API | ASP.NET Core Web API (.NET 8) | Fast, well-supported, easy to host |
-| Speech-to-text | Whisper.net | .NET wrapper around OpenAI Whisper, runs locally, no API cost |
-| Audio conversion | FFmpeg | Handles almost any audio format reliably |
-| Database | SQL Server / PostgreSQL (EF Core) | Transcripts and job tracking |
-| File storage | Local disk (dev) / S3 or Azure Blob (prod) | Audio files are large and should not go in the database |
-| Background jobs | `BackgroundService` + `Channel<T>` | Keeps uploads fast and processing separate |
+- ASP.NET Core Web API (.NET 8)
+- Whisper.net for speech to text
+- FFmpeg / ffprobe for converting audio
+- SQLite with EF Core (code first). I picked SQLite because it needs no setup. The database file is created on startup. Moving to SQL Server or PostgreSQL only means changing the provider in `Program.cs`.
+- `BackgroundService` + `Channel<T>` for the job queue
 
----
-
-## 3. Project Structure
+## Project structure
 
 ```
-TranscriptionService/
-├── Controllers/
-│   └── TranscriptionsController.cs     # API endpoints
-├── Services/
-│   ├── AudioNormalizer.cs              # Runs FFmpeg to convert audio to 16 kHz mono WAV
-│   ├── AudioChunker.cs                 # Splits long audio into chunks with overlap
-│   ├── WhisperTranscriber.cs           # Loads Whisper model once, transcribes WAV
-│   ├── TranscriptionWorker.cs          # Background worker that processes queued jobs
-│   └── JobQueue.cs                     # In-memory queue (Channel<T>)
-├── Storage/
-│   ├── IFileStorage.cs                 # Interface so storage can be swapped
-│   └── LocalFileStorage.cs             # Saves files to disk
-├── Data/
-│   ├── AppDbContext.cs                 # EF Core context
-│   ├── TranscriptionJob.cs             # Job entity
-│   └── TranscriptSegment.cs            # Segment entity
-├── Models/
-│   ├── TranscriptionResponse.cs        # API response DTO
-│   └── SegmentDto.cs
-├── appsettings.json
-└── Program.cs
+AudioTranscriber/
+  Controllers/   API endpoints
+  Services/      validation, FFmpeg, chunking, Whisper, worker, queue, export
+  Storage/       IFileStorage and the local disk implementation
+  Data/          DbContext and entities (TranscriptionJob, TranscriptSegment)
+  Migrations/    EF Core migrations
+  Models/        request and response DTOs
 ```
 
----
+## Transcription pipeline
 
-## 4. Part 1 – Transcription Pipeline
+**Upload.** The file is checked for size (200 MB by default), extension, content type and the first bytes of the file, so a renamed text file is rejected. It is saved to disk under the job id so names never clash. Then ffprobe checks that the file can be decoded. If not, the API returns 400.
 
-### 4.1 Accepting an audio file
+**Formats.** WAV, MP3, M4A, FLAC, OGG and WebM are supported. Every file goes through FFmpeg and becomes a 16 kHz mono WAV, which is what Whisper needs. This way the transcription code only deals with one format.
 
-- `POST /api/transcriptions` accepts a multipart file upload.
-- The file is validated by **size** (configurable limit, e.g. 200 MB) and **format** (checked by content type and file header, not just extension).
-- The file is streamed to disk with a unique GUID-based name so uploads never overwrite each other.
-- A job record is created with status `Queued` and the job ID is returned to the client immediately.
+**Whisper.** The model (`ggml-base.bin`) is loaded once at startup because loading it is slow. If the file is missing it is downloaded on the first run.
 
-### 4.2 Transcribing speech to text
+**Long files.** Files longer than 120 seconds are cut into chunks. Each chunk starts 2 seconds early so words at the edge are not lost. Timestamps are shifted by the chunk start so they are correct for the whole file, and text that was heard twice in the overlap is removed when merging.
 
-- **Whisper.net** is used to convert audio to text.
-- The Whisper model (e.g. `ggml-base.bin`) is loaded **once** at startup and reused for every request. Loading the model is slow, so this avoids repeating that cost.
-- Before transcription, every file is normalized with FFmpeg into the format Whisper expects: **16 kHz, mono, 16-bit PCM WAV**.
-
-### 4.3 Timestamps per segment
-
-Whisper.net returns results as segments, each with a start time, end time, and text. These are mapped to a simple DTO and returned as JSON:
+**Result.** Timestamps are in seconds:
 
 ```json
 {
@@ -99,127 +66,60 @@ Whisper.net returns results as segments, each with a start time, end time, and t
 }
 ```
 
-Timestamps are in seconds. An export endpoint can convert the same segments into SRT or VTT.
+## System design
 
-### 4.4 Handling different audio formats
+**Concurrent uploads.** Whisper is CPU heavy, so the worker only runs a fixed number of jobs at a time (`MaxConcurrentJobs`). Other jobs wait in the queue. If more scale is needed, the in-memory queue can be replaced with RabbitMQ or Azure Service Bus.
 
-- Supported inputs: WAV, MP3, M4A, FLAC, OGG, WebM.
-- Instead of writing a decoder for each format, **every file goes through FFmpeg** and comes out as the same 16 kHz mono WAV.
-- The transcription code only ever sees one format, which keeps it simple.
-- Adding a new format only means updating the validation list.
-- If FFmpeg cannot decode the file, the API returns `400 Bad Request` with a clear error.
+**Storage.** Audio files go to disk (`uploads/`). Job info and segments go to the database. The job only stores the file path, so the storage can later be moved to S3 or Azure Blob by adding another `IFileStorage`.
 
-### 4.5 Handling long audio files
+**Retries and recovery.** A job goes `Queued -> Processing -> Completed / Failed`.
 
-- Long files are **split into chunks** (around 30 seconds to a few minutes) using FFmpeg, with a small overlap so words at the edge are not cut off. Silence detection can be used to split at natural pauses.
-- Each chunk is transcribed separately, and segment timestamps are shifted by the chunk's start time so they stay correct for the full file.
-- Repeated text at chunk boundaries is removed when the results are merged.
-- Processing runs in the background. The client gets a job ID right away and polls `GET /api/transcriptions/{id}` for the result.
-- Files are streamed to disk, not loaded into memory, so memory stays flat regardless of file size.
+- Temporary errors (timeouts, crashes) are retried up to 3 times, waiting longer each time (10s, then 20s).
+- If FFmpeg can't read the file, the job fails straight away because retrying won't help.
+- The queue is in memory, so on startup unfinished jobs are loaded from the database and queued again.
+- Failed jobs keep their error message and can be retried by hand.
 
----
+## API
 
-## 5. Part 2 – System Design
+- `POST /api/transcriptions` - upload audio, returns 202 with the job id
+- `GET /api/transcriptions/{id}` - job status and transcript
+- `GET /api/transcriptions/{id}/export?format=srt|vtt|txt` - download as subtitles or text
+- `POST /api/transcriptions/{id}/retry` - retry a failed job
+- `DELETE /api/transcriptions/{id}` - not implemented yet (returns 501)
 
-### 5.1 Concurrent uploads
+Errors use the standard ProblemDetails format: 400 bad file, 413 too large, 404 job not found, 409 job not in the right state.
 
-- The upload endpoint only saves the file, creates a job with status `Queued`, and returns a job ID. All heavy work happens in a background worker.
-- Whisper uses a lot of CPU, so the worker processes only a **fixed number of jobs at a time** (e.g. one per CPU core). Extra jobs wait in the queue instead of overloading the server.
-- Unique file names prevent collisions, and a file size limit plus rate limiting protects against abuse.
-- If traffic grows, the in-memory queue can be replaced with a message broker (RabbitMQ, Azure Service Bus) so more worker instances can be added.
+## Running locally
 
-### 5.2 Storing audio and transcripts
-
-- **Audio files** → file storage (local disk in dev, S3 / Azure Blob in production), named by job ID. Old files are deleted automatically after a retention period.
-- **Transcripts and job info** → SQL database:
-  - `Jobs` table: job ID, status, original filename, duration, attempts, error message, created/completed time.
-  - `Segments` table: job ID, start, end, text.
-- Keeping segments in the database makes searching and exporting easy without re-running transcription.
-- The job record only stores the file path, so the storage backend can be swapped without changing the schema.
-
-### 5.3 Retrying and recovering failed transcriptions
-
-- Job states: `Queued → Processing → Completed / Failed`.
-- **Temporary failures** (worker crash, out of memory, FFmpeg timeout) are retried automatically a few times with a growing delay between attempts.
-- **Permanent failures** (corrupt or unsupported file) are marked `Failed` immediately with the error saved.
-- Because the file is saved before processing starts, a crashed worker loses nothing. On restart, jobs stuck in `Processing` for too long are put back in the queue.
-- Jobs that fail all retries are kept aside so they can be inspected and retried manually.
-- Chunked processing allows a long file to resume from the last finished chunk instead of starting over.
-
-### 5.4 API design
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `POST` | `/api/transcriptions` | Upload audio, returns `202 Accepted` with job ID |
-| `GET` | `/api/transcriptions/{id}` | Get job status and transcript when complete |
-| `GET` | `/api/transcriptions/{id}/export?format=srt\|vtt\|txt` | Download in subtitle/text format |
-| `DELETE` | `/api/transcriptions/{id}` | Delete job and its files |
-
-- Documented with Swagger / OpenAPI.
-- Secured with API keys or JWT.
-- Optional webhook URL can be passed at upload so the client is notified when the job finishes instead of polling.
-- Standard status codes: `400` invalid file, `413` file too large, `404` unknown job, `429` rate limited.
-- Health-check endpoint (`/health`) so the service can be containerized and monitored.
-
----
-
-## 6. Running Locally
-
-### Prerequisites
-
-- .NET 8 SDK
-- FFmpeg installed and available on `PATH`
-- A Whisper model file (e.g. `ggml-base.bin`) placed in the `Models/` folder
-
-### Steps
+You need the .NET 8 SDK and FFmpeg on your PATH. The first run downloads the Whisper model (about 150 MB). You can also put `ggml-base.bin` in `AudioTranscriber/whisper-models/` yourself.
 
 ```bash
-# 1. Restore packages
-dotnet restore
-
-# 2. Apply database migrations
-dotnet ef database update
-
-# 3. Run the API
-dotnet run
-
-# 4. Open Swagger
-# https://localhost:5001/swagger
+cd AudioTranscriber
+dotnet run --launch-profile http
 ```
 
-### Example request
+Swagger is at http://localhost:5080/swagger. I used port 5080 because 5000 is taken by AirPlay on macOS.
 
 ```bash
-curl -X POST https://localhost:5001/api/transcriptions \
-  -F "file=@sample.mp3"
-
-# Response
-# { "jobId": "3f1c...", "status": "Queued" }
-
-curl https://localhost:5001/api/transcriptions/3f1c...
+curl -X POST http://localhost:5080/api/transcriptions -F "file=@sample.mp3"
+curl http://localhost:5080/api/transcriptions/{jobId}
+curl -OJ "http://localhost:5080/api/transcriptions/{jobId}/export?format=srt"
 ```
 
-### Key NuGet packages
+Settings like chunk size, retry count, upload limit and model type are in `appsettings.json`.
 
-```
-Whisper.net
-Whisper.net.Runtime
-Microsoft.EntityFrameworkCore
-Microsoft.EntityFrameworkCore.SqlServer   (or Npgsql.EntityFrameworkCore.PostgreSQL)
-Swashbuckle.AspNetCore
-```
+## Limitations
 
----
+- Only one instance should run, since the queue is in memory.
+- With very short chunks, Whisper can hear the overlap a bit differently in each chunk, so some repeated text can stay in the result.
+- A retried job starts again from the beginning instead of the last finished chunk.
+- Delete is not implemented yet.
 
-## 7. Mock Data
+## Future improvements
 
-Sample audio files are placed in `samples/`. For testing without a real model, `WhisperTranscriber` can be swapped with a `MockTranscriber` (via the `ITranscriber` interface) that returns fixed segments.
-
----
-
-## 8. Future Improvements
-
-- Replace in-memory queue with RabbitMQ / Azure Service Bus for multi-instance scaling
-- GPU support for faster Whisper inference
-- Speaker diarization (who said what)
-- Language detection and translation
+- Delete endpoint and cleanup of old audio files
+- API key or JWT auth, rate limiting and a health check endpoint
+- Webhook to notify the client instead of polling
+- Split long files at silences
+- S3 / Azure Blob storage and a message broker for more instances
+- GPU support, speaker detection, translation
