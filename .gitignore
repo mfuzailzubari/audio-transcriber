@@ -490,3 +490,6 @@ $RECYCLE.BIN/
 
 # Uploaded audio files
 uploads/
+
+# Whisper model files (downloaded on first run)
+whisper-models/

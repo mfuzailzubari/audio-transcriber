@@ -3,6 +3,7 @@ using AudioTranscriber.Services;
 using AudioTranscriber.Storage;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Options;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -28,6 +29,7 @@ builder.Services.Configure<FormOptions>(options => options.MultipartBodyLengthLi
 
 builder.Services.Configure<TranscriptionOptions>(builder.Configuration.GetSection(TranscriptionOptions.SectionName));
 builder.Services.AddSingleton<JobQueue>();
+builder.Services.Configure<WhisperOptions>(builder.Configuration.GetSection(WhisperOptions.SectionName));
 builder.Services.AddSingleton<ITranscriber, WhisperTranscriber>();
 builder.Services.AddHostedService<TranscriptionWorker>();
 
@@ -39,6 +41,10 @@ using (var scope = app.Services.CreateScope())
     var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
     db.Database.Migrate();
 }
+
+// Download the Whisper model on first run so the worker can load it
+var whisperOptions = app.Services.GetRequiredService<IOptions<WhisperOptions>>().Value;
+await WhisperModelDownloader.EnsureModelExistsAsync(whisperOptions, app.Logger);
 
 if (app.Environment.IsDevelopment())
 {
