@@ -26,6 +26,11 @@ var maxRequestBytes = uploadOptions.MaxFileSizeBytes + 10 * 1024 * 1024;
 builder.WebHost.ConfigureKestrel(options => options.Limits.MaxRequestBodySize = maxRequestBytes);
 builder.Services.Configure<FormOptions>(options => options.MultipartBodyLengthLimit = maxRequestBytes);
 
+builder.Services.Configure<TranscriptionOptions>(builder.Configuration.GetSection(TranscriptionOptions.SectionName));
+builder.Services.AddSingleton<JobQueue>();
+builder.Services.AddSingleton<ITranscriber, WhisperTranscriber>();
+builder.Services.AddHostedService<TranscriptionWorker>();
+
 var app = builder.Build();
 
 // Create the SQLite database and apply migrations on startup so no manual setup is needed

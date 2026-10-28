@@ -15,6 +15,7 @@ public class TranscriptionsController : ControllerBase
     private readonly AppDbContext _db;
     private readonly IFileStorage _storage;
     private readonly AudioFileValidator _validator;
+    private readonly JobQueue _queue;
     private readonly UploadOptions _uploadOptions;
     private readonly ILogger<TranscriptionsController> _logger;
 
@@ -22,12 +23,14 @@ public class TranscriptionsController : ControllerBase
         AppDbContext db,
         IFileStorage storage,
         AudioFileValidator validator,
+        JobQueue queue,
         IOptions<UploadOptions> uploadOptions,
         ILogger<TranscriptionsController> logger)
     {
         _db = db;
         _storage = storage;
         _validator = validator;
+        _queue = queue;
         _uploadOptions = uploadOptions.Value;
         _logger = logger;
     }
@@ -88,6 +91,9 @@ public class TranscriptionsController : ControllerBase
             await _storage.DeleteAsync(storedPath);
             throw;
         }
+
+        // Heavy work happens in the background worker, the client gets the job id right away
+        await _queue.EnqueueAsync(job.Id, cancellationToken);
 
         _logger.LogInformation("Job {JobId} created for file {FileName}", job.Id, job.OriginalFileName);
 
