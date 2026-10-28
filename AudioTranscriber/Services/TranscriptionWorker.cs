@@ -165,8 +165,9 @@ public class TranscriptionWorker : BackgroundService
                 {
                     JobId = job.Id,
                     Index = i,
-                    Start = segments[i].Start,
-                    End = segments[i].End,
+                    // Keep 2 decimals, adding chunk offsets leaves values like 204.98000000000002
+                    Start = Math.Round(segments[i].Start, 2),
+                    End = Math.Round(segments[i].End, 2),
                     Text = segments[i].Text
                 });
             }
@@ -241,7 +242,7 @@ public class TranscriptionWorker : BackgroundService
     {
         // Measure the converted file, it is the exact audio Whisper will hear
         var duration = await _normalizer.GetDurationAsync(wavPath, stoppingToken);
-        job.DurationSeconds = duration;
+        job.DurationSeconds = Math.Round(duration, 2);
 
         if (!_chunker.NeedsChunking(duration))
         {

@@ -94,7 +94,7 @@ public class TranscriptionsController : ControllerBase
             OriginalFileName = Path.GetFileName(file.FileName),
             StoredFilePath = storedPath,
             FileSizeBytes = file.Length,
-            DurationSeconds = duration
+            DurationSeconds = Math.Round(duration, 2)
         };
 
         try

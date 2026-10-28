@@ -4,7 +4,7 @@ public class UploadOptions
 {
     public const string SectionName = "Upload";
 
-    public int MaxFileSizeMb { get; set; } = 200;
+    public int MaxFileSizeMb { get; set; } = 20;
 
     // Set in appsettings.json (a default here would be merged with the config list, not replaced)
     public string[] AllowedExtensions { get; set; } = Array.Empty<string>();
