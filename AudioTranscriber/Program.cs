@@ -28,6 +28,9 @@ builder.WebHost.ConfigureKestrel(options => options.Limits.MaxRequestBodySize = 
 builder.Services.Configure<FormOptions>(options => options.MultipartBodyLengthLimit = maxRequestBytes);
 
 builder.Services.Configure<TranscriptionOptions>(builder.Configuration.GetSection(TranscriptionOptions.SectionName));
+builder.Services.Configure<FFmpegOptions>(builder.Configuration.GetSection(FFmpegOptions.SectionName));
+builder.Services.AddSingleton<AudioNormalizer>();
+builder.Services.AddSingleton<AudioChunker>();
 builder.Services.AddSingleton<JobQueue>();
 builder.Services.Configure<WhisperOptions>(builder.Configuration.GetSection(WhisperOptions.SectionName));
 builder.Services.AddSingleton<ITranscriber, WhisperTranscriber>();

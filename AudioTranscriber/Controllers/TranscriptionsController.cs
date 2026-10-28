@@ -16,6 +16,7 @@ public class TranscriptionsController : ControllerBase
     private readonly IFileStorage _storage;
     private readonly AudioFileValidator _validator;
     private readonly JobQueue _queue;
+    private readonly AudioNormalizer _normalizer;
     private readonly UploadOptions _uploadOptions;
     private readonly ILogger<TranscriptionsController> _logger;
 
@@ -24,6 +25,7 @@ public class TranscriptionsController : ControllerBase
         IFileStorage storage,
         AudioFileValidator validator,
         JobQueue queue,
+        AudioNormalizer normalizer,
         IOptions<UploadOptions> uploadOptions,
         ILogger<TranscriptionsController> logger)
     {
@@ -31,6 +33,7 @@ public class TranscriptionsController : ControllerBase
         _storage = storage;
         _validator = validator;
         _queue = queue;
+        _normalizer = normalizer;
         _uploadOptions = uploadOptions.Value;
         _logger = logger;
     }
@@ -71,13 +74,26 @@ public class TranscriptionsController : ControllerBase
             storedPath = await _storage.SaveAsync(stream, $"{jobId}{extension}", cancellationToken);
         }
 
+        // Check FFmpeg can actually decode the file, so a broken file is rejected now instead of failing later
+        double duration;
+        try
+        {
+            duration = await _normalizer.GetDurationAsync(_storage.GetLocalPath(storedPath), cancellationToken);
+        }
+        catch (AudioConversionException ex)
+        {
+            await _storage.DeleteAsync(storedPath);
+            return Problem(statusCode: StatusCodes.Status400BadRequest, detail: ex.Message);
+        }
+
         var job = new TranscriptionJob
         {
             Id = jobId,
             Status = JobStatus.Queued,
             OriginalFileName = Path.GetFileName(file.FileName),
             StoredFilePath = storedPath,
-            FileSizeBytes = file.Length
+            FileSizeBytes = file.Length,
+            DurationSeconds = duration
         };
 
         try

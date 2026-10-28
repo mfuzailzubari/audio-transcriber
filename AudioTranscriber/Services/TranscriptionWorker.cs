@@ -10,6 +10,8 @@ public class TranscriptionWorker : BackgroundService
     private readonly JobQueue _queue;
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly IFileStorage _storage;
+    private readonly AudioNormalizer _normalizer;
+    private readonly AudioChunker _chunker;
     private readonly ITranscriber _transcriber;
     private readonly TranscriptionOptions _options;
     private readonly ILogger<TranscriptionWorker> _logger;
@@ -18,6 +20,8 @@ public class TranscriptionWorker : BackgroundService
         JobQueue queue,
         IServiceScopeFactory scopeFactory,
         IFileStorage storage,
+        AudioNormalizer normalizer,
+        AudioChunker chunker,
         ITranscriber transcriber,
         IOptions<TranscriptionOptions> options,
         ILogger<TranscriptionWorker> logger)
@@ -25,6 +29,8 @@ public class TranscriptionWorker : BackgroundService
         _queue = queue;
         _scopeFactory = scopeFactory;
         _storage = storage;
+        _normalizer = normalizer;
+        _chunker = chunker;
         _transcriber = transcriber;
         _options = options.Value;
         _logger = logger;
@@ -91,10 +97,18 @@ public class TranscriptionWorker : BackgroundService
 
         _logger.LogInformation("Processing job {JobId} (attempt {Attempt})", job.Id, job.Attempts);
 
+        // Temporary files for this job (converted WAV and chunks) are kept in their own folder
+        var workFolder = Path.Combine(Path.GetTempPath(), "audiotranscriber", job.Id.ToString());
+        Directory.CreateDirectory(workFolder);
+
         try
         {
-            var filePath = _storage.GetLocalPath(job.StoredFilePath);
-            var segments = await _transcriber.TranscribeAsync(filePath, stoppingToken);
+            // Whisper only accepts 16 kHz mono WAV, so every upload is converted first
+            var inputPath = _storage.GetLocalPath(job.StoredFilePath);
+            var wavPath = Path.Combine(workFolder, "normalized.wav");
+            await _normalizer.NormalizeAsync(inputPath, wavPath, stoppingToken);
+
+            var segments = await TranscribeFileAsync(job, wavPath, workFolder, stoppingToken);
 
             for (var i = 0; i < segments.Count; i++)
             {
@@ -125,5 +139,40 @@ public class TranscriptionWorker : BackgroundService
             job.CompletedAt = DateTime.UtcNow;
             await db.SaveChangesAsync(CancellationToken.None);
         }
+        finally
+        {
+            // The original upload is kept, only the temporary converted files are removed
+            if (Directory.Exists(workFolder))
+            {
+                Directory.Delete(workFolder, recursive: true);
+            }
+        }
+    }
+
+    private async Task<List<TranscribedSegment>> TranscribeFileAsync(TranscriptionJob job, string wavPath,
+        string workFolder, CancellationToken stoppingToken)
+    {
+        // Measure the converted file, it is the exact audio Whisper will hear
+        var duration = await _normalizer.GetDurationAsync(wavPath, stoppingToken);
+        job.DurationSeconds = duration;
+
+        if (!_chunker.NeedsChunking(duration))
+        {
+            return await _transcriber.TranscribeAsync(wavPath, stoppingToken);
+        }
+
+        var chunks = await _chunker.SplitAsync(wavPath, duration, workFolder, stoppingToken);
+        _logger.LogInformation("Job {JobId} split into {ChunkCount} chunks", job.Id, chunks.Count);
+
+        var merged = new List<TranscribedSegment>();
+        for (var i = 0; i < chunks.Count; i++)
+        {
+            var chunkSegments = await _transcriber.TranscribeAsync(chunks[i].FilePath, stoppingToken);
+            SegmentMerger.AddChunk(merged, chunkSegments, chunks[i].StartSeconds);
+
+            _logger.LogInformation("Job {JobId} chunk {Chunk}/{ChunkCount} done", job.Id, i + 1, chunks.Count);
+        }
+
+        return merged;
     }
 }
